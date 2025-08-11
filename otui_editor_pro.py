@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QPushButton, QTreeWidget, QTreeWidgetItem, QLabel, QLineEdit,
     QFormLayout, QMessageBox, QToolBar, QStatusBar, QSizePolicy, QPlainTextEdit
 )
-from PySide6.QtGui import QPixmap, QAction
+from PySide6.QtGui import QPixmap, QAction, QPainter
 from PySide6.QtCore import Qt, QTimer
 
 # ==============
@@ -163,6 +163,27 @@ def resolve_image(images_base: Optional[Path], otui_dir: Path, val: str) -> Opti
         if c.exists(): return c
     return None
 
+def draw_nine_slice(pix: QPixmap, left: int, top: int, right: int, bottom: int, w: int, h: int) -> QPixmap:
+    """Return pixmap scaled using 9-slice algorithm."""
+    out = QPixmap(w, h)
+    out.fill(Qt.transparent)
+    painter = QPainter(out)
+    sw, sh = pix.width(), pix.height()
+    # cantos
+    painter.drawPixmap(0, 0, pix.copy(0, 0, left, top))
+    painter.drawPixmap(w - right, 0, pix.copy(sw - right, 0, right, top))
+    painter.drawPixmap(0, h - bottom, pix.copy(0, sh - bottom, left, bottom))
+    painter.drawPixmap(w - right, h - bottom, pix.copy(sw - right, sh - bottom, right, bottom))
+    # bordas
+    painter.drawPixmap(left, 0, w - left - right, top, pix.copy(left, 0, sw - left - right, top))
+    painter.drawPixmap(left, h - bottom, w - left - right, bottom, pix.copy(left, sh - bottom, sw - left - right, bottom))
+    painter.drawPixmap(0, top, left, h - top - bottom, pix.copy(0, top, left, sh - top - bottom))
+    painter.drawPixmap(w - right, top, right, h - top - bottom, pix.copy(sw - right, top, right, sh - top - bottom))
+    # centro
+    painter.drawPixmap(left, top, w - left - right, h - top - bottom, pix.copy(left, top, sw - left - right, sh - top - bottom))
+    painter.end()
+    return out
+
 # ==============
 # Editor PySide6 – com texto OTUI em tempo real
 # ==============
@@ -176,6 +197,7 @@ class OTUIEditor(QMainWindow):
         self.current_file: Optional[Path] = None
         self.current_root: Optional[OTUINode] = None
         self.images_base: Optional[Path] = None
+        self.project_path: Optional[Path] = None
 
         self.undo_stack: List[str] = []
         self.redo_stack: List[str] = []
@@ -186,6 +208,7 @@ class OTUIEditor(QMainWindow):
     def _build_ui(self):
         tb = QToolBar("Ações", self); self.addToolBar(tb)
         act_open = QAction("Abrir", self); act_open.triggered.connect(self.open_file); tb.addAction(act_open)
+        act_open_proj = QAction("Abrir projeto", self); act_open_proj.triggered.connect(self.open_project); tb.addAction(act_open_proj)
         act_save = QAction("Salvar", self); act_save.triggered.connect(self.save_file); tb.addAction(act_save)
         act_saveas = QAction("Salvar como...", self); act_saveas.triggered.connect(self.save_as); tb.addAction(act_saveas)
         tb.addSeparator()
@@ -197,13 +220,20 @@ class OTUIEditor(QMainWindow):
 
         self.status = QStatusBar(self); self.setStatusBar(self.status)
 
-        # Layout principal: esquerda árvore, meio edição + texto, direita preview
+        # Layout principal: esquerda (projeto + árvore), meio edição + texto, direita preview
         big_split = QSplitter(Qt.Horizontal, self)
 
-        # Árvore
+        # Esquerda: projeto e árvore do OTUI
+        left_split = QSplitter(Qt.Vertical, self)
+        self.project_tree = QTreeWidget(); self.project_tree.setHeaderLabels(["Projeto"])
+        self.project_tree.itemClicked.connect(self.on_project_item)
+        left_split.addWidget(self.project_tree)
+
         self.tree = QTreeWidget(); self.tree.setHeaderLabels(["Tag", "Value"])
         self.tree.itemClicked.connect(self.on_tree_click)
-        big_split.addWidget(self.tree)
+        left_split.addWidget(self.tree)
+
+        big_split.addWidget(left_split)
 
         # Meio: edição + texto
         mid_widget = QWidget(); mid_layout = QVBoxLayout(mid_widget)
@@ -241,16 +271,21 @@ class OTUIEditor(QMainWindow):
     # ---------- Arquivo ----------
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Abrir .otui", "", "OTUI (*.otui);;Todos (*.*)")
-        if not path: return
-        fp = Path(path)
+        if not path:
+            return
+        self._open_file_from_path(Path(path))
+
+    def _open_file_from_path(self, fp: Path):
         try:
             txt = fp.read_text(encoding="utf-8")
         except Exception as e:
             QMessageBox.critical(self, "Erro", f"Falha ao ler: {e}"); return
         self.current_file = fp
         # backup
-        try: shutil.copy(fp, fp.with_suffix(fp.suffix + ".bak"))
-        except Exception: pass
+        try:
+            shutil.copy(fp, fp.with_suffix(fp.suffix + ".bak"))
+        except Exception:
+            pass
         self.text.blockSignals(True)
         self.text.setPlainText(txt)
         self.text.blockSignals(False)
@@ -258,8 +293,46 @@ class OTUIEditor(QMainWindow):
         self._reparse_from_text(push_history=True)
         # tentar descobrir base de imagens
         self.images_base = discover_images_base(fp, self.current_root) if self.current_root else None
-        if self.images_base: self.status.showMessage(f"Pasta de imagens: {self.images_base}", 6000)
-        else: self.status.showMessage("Defina/descubra a pasta de imagens para o preview.", 6000)
+        if self.images_base:
+            self.status.showMessage(f"Pasta de imagens: {self.images_base}", 6000)
+        else:
+            self.status.showMessage("Defina/descubra a pasta de imagens para o preview.", 6000)
+
+    def open_project(self):
+        path = QFileDialog.getExistingDirectory(self, "Abrir projeto")
+        if not path:
+            return
+        self.project_path = Path(path)
+        self._populate_project_tree()
+
+    def _populate_project_tree(self):
+        self.project_tree.clear()
+        if not self.project_path:
+            return
+        root_item = QTreeWidgetItem([self.project_path.name])
+        self.project_tree.addTopLevelItem(root_item)
+        for p in sorted(self.project_path.rglob("*.otui")):
+            rel = p.relative_to(self.project_path)
+            parent = root_item
+            for part in rel.parts[:-1]:
+                child = None
+                for i in range(parent.childCount()):
+                    if parent.child(i).text(0) == part:
+                        child = parent.child(i)
+                        break
+                if child is None:
+                    child = QTreeWidgetItem([part])
+                    parent.addChild(child)
+                parent = child
+            item = QTreeWidgetItem([rel.name])
+            item.setData(0, Qt.UserRole, str(p))
+            parent.addChild(item)
+        self.project_tree.expandAll()
+
+    def on_project_item(self, item: QTreeWidgetItem, col: int):
+        path = item.data(0, Qt.UserRole)
+        if path:
+            self._open_file_from_path(Path(path))
 
     def save_file(self):
         if not self.current_file:
@@ -355,8 +428,10 @@ class OTUIEditor(QMainWindow):
             self.preview_label.setText("Pré-visualização de imagem"); self.preview_label.setPixmap(QPixmap()); return
         tag = it.text(0).strip().lower()
         val = it.text(1).strip()
-        # se for image-source ou parecer caminho de imagem
-        if tag == "image-source" or "images" in val.lower() or any(val.lower().endswith(e) for e in IMG_EXTS):
+        # se for preview de imagem ou borda
+        if tag == "border-image":
+            self._preview_border_image(val)
+        elif tag == "image-source" or "images" in val.lower() or any(val.lower().endswith(e) for e in IMG_EXTS):
             self._preview_image(val)
         else:
             self.preview_label.setText("Pré-visualização de imagem"); self.preview_label.setPixmap(QPixmap())
@@ -373,6 +448,24 @@ class OTUIEditor(QMainWindow):
                 self.preview_label.setPixmap(pix.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
                 self.preview_label.setToolTip(str(full))
                 return
+        self.preview_label.setText("Imagem não encontrada"); self.preview_label.setPixmap(QPixmap())
+
+    def _preview_border_image(self, val: str):
+        parts = val.split()
+        if not parts:
+            self.preview_label.setText("Sem valor para border-image"); self.preview_label.setPixmap(QPixmap()); return
+        img = parts[0]
+        cuts = [int(p) for p in parts[1:5]] if len(parts) >= 5 else [0, 0, 0, 0]
+        v = img.strip().strip("'").strip('"')
+        otui_dir = self.current_file.parent if self.current_file else Path.cwd()
+        full = resolve_image(self.images_base, otui_dir, v)
+        if full and full.exists():
+            pix = QPixmap(str(full))
+            l, t, r, b = cuts
+            out = draw_nine_slice(pix, l, t, r, b, self.preview_label.width(), self.preview_label.height())
+            self.preview_label.setPixmap(out)
+            self.preview_label.setToolTip(str(full))
+            return
         self.preview_label.setText("Imagem não encontrada"); self.preview_label.setPixmap(QPixmap())
 
     # ---------- Undo/Redo ----------
