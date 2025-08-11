@@ -8,8 +8,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QPushButton, QTreeWidget, QTreeWidgetItem, QLabel, QLineEdit,
     QFormLayout, QMessageBox, QToolBar, QStatusBar, QSizePolicy, QPlainTextEdit
 )
-from PySide6.QtGui import QPixmap, QAction
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QPixmap, QAction, QPainter
+from PySide6.QtCore import Qt, QTimer, QEvent
 
 # ==============
 # Parser OTUI/OTML simplificado (fiel ao esquema de indentação) + serializer
@@ -180,6 +180,11 @@ class OTUIEditor(QMainWindow):
         self.undo_stack: List[str] = []
         self.redo_stack: List[str] = []
 
+        self.offset_x = 0
+        self.offset_y = 0
+        self.last_coords = (-1, -1)
+        self._last_preview_item = None
+
         self._build_ui()
         self._setup_live_parse()
 
@@ -224,7 +229,18 @@ class OTUIEditor(QMainWindow):
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumSize(350, 350)
         self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview_label.setMouseTracking(True)
+        self.preview_label.installEventFilter(self)
+        self.preview_label.setFocusPolicy(Qt.StrongFocus)
         rlay.addWidget(self.preview_label)
+        self.preview_info = QLabel("Coords: -, - | Offset: 0,0 | Elemento: nenhum")
+        rlay.addWidget(self.preview_info)
+        btns = QHBoxLayout()
+        for text, dx, dy in [("↑", 0, -1), ("↓", 0, 1), ("←", -1, 0), ("→", 1, 0)]:
+            b = QPushButton(text)
+            b.clicked.connect(lambda _, dx=dx, dy=dy: self.shift_image(dx, dy))
+            btns.addWidget(b)
+        rlay.addLayout(btns)
         big_split.addWidget(right)
 
         container = QWidget(); lay = QVBoxLayout(container)
@@ -351,8 +367,14 @@ class OTUIEditor(QMainWindow):
     # ---------- Preview ----------
     def update_preview_from_selection(self):
         it = self.tree.currentItem()
+        if it is not self._last_preview_item:
+            self.offset_x = 0
+            self.offset_y = 0
+            self._last_preview_item = it
         if not it:
-            self.preview_label.setText("Pré-visualização de imagem"); self.preview_label.setPixmap(QPixmap()); return
+            self.preview_label.setText("Pré-visualização de imagem"); self.preview_label.setPixmap(QPixmap())
+            self._update_preview_info()
+            return
         tag = it.text(0).strip().lower()
         val = it.text(1).strip()
         # se for image-source ou parecer caminho de imagem
@@ -360,6 +382,7 @@ class OTUIEditor(QMainWindow):
             self._preview_image(val)
         else:
             self.preview_label.setText("Pré-visualização de imagem"); self.preview_label.setPixmap(QPixmap())
+        self._update_preview_info()
 
     def _preview_image(self, val: str):
         if not val:
@@ -370,10 +393,48 @@ class OTUIEditor(QMainWindow):
         if full and full.exists():
             pix = QPixmap(str(full))
             if not pix.isNull():
-                self.preview_label.setPixmap(pix.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                scaled = pix.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                if self.offset_x or self.offset_y:
+                    shifted = QPixmap(scaled.size())
+                    shifted.fill(Qt.transparent)
+                    painter = QPainter(shifted)
+                    painter.drawPixmap(self.offset_x, self.offset_y, scaled)
+                    painter.end()
+                    scaled = shifted
+                self.preview_label.setPixmap(scaled)
                 self.preview_label.setToolTip(str(full))
                 return
         self.preview_label.setText("Imagem não encontrada"); self.preview_label.setPixmap(QPixmap())
+
+    def shift_image(self, dx: int, dy: int):
+        self.offset_x += dx
+        self.offset_y += dy
+        self.update_preview_from_selection()
+
+    def _update_preview_info(self):
+        x, y = self.last_coords
+        coord = f"{x}, {y}" if x >= 0 and y >= 0 else "-, -"
+        it = self.tree.currentItem()
+        elem = it.text(0) if it else "nenhum"
+        self.preview_info.setText(f"Coords: {coord} | Offset: {self.offset_x},{self.offset_y} | Elemento: {elem}")
+
+    def eventFilter(self, obj, event):
+        if obj is self.preview_label:
+            if event.type() == QEvent.MouseMove:
+                p = event.position()
+                self.last_coords = (int(p.x()), int(p.y()))
+                self._update_preview_info()
+            elif event.type() == QEvent.KeyPress:
+                key = event.key()
+                if key == Qt.Key_Left:
+                    self.shift_image(-1, 0); return True
+                elif key == Qt.Key_Right:
+                    self.shift_image(1, 0); return True
+                elif key == Qt.Key_Up:
+                    self.shift_image(0, -1); return True
+                elif key == Qt.Key_Down:
+                    self.shift_image(0, 1); return True
+        return super().eventFilter(obj, event)
 
     # ---------- Undo/Redo ----------
     def undo(self):
