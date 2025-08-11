@@ -44,7 +44,7 @@ class OTUIParser:
                 while stack and d <= stack[-1].depth: stack.pop()
                 node = OTUINode("//", stripped[2:].strip(), d, [])
                 stack[-1].children.append(node)
-                stack.append(node)
+                # comentários não devem formar hierarquia; não empilha
                 continue
             d = depth_of(raw_line, stripped)
             while stack and d <= stack[-1].depth: stack.pop()
