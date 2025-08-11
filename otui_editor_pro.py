@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QFormLayout, QMessageBox, QToolBar, QStatusBar, QSizePolicy, QPlainTextEdit
 )
 from PySide6.QtGui import QPixmap, QAction
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 
 # ==============
 # Parser OTUI/OTML simplificado (fiel ao esquema de indentação) + serializer
@@ -164,6 +164,56 @@ def resolve_image(images_base: Optional[Path], otui_dir: Path, val: str) -> Opti
     return None
 
 # ==============
+# Widget de pré-visualização com coordenadas
+# ==============
+
+class ImagePreviewLabel(QLabel):
+    coordsChanged = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(350, 350)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
+        self._orig = None
+        self._scaled = None
+
+    def setPixmap(self, pix):
+        self._orig = pix
+        if pix and not pix.isNull():
+            self._scaled = pix.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            super().setPixmap(self._scaled)
+        else:
+            self._scaled = None
+            super().setPixmap(pix)
+
+    def resizeEvent(self, event):
+        if self._orig and not self._orig.isNull():
+            self._scaled = self._orig.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            super().setPixmap(self._scaled)
+        super().resizeEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self._orig or not self._scaled:
+            return
+        lw, lh = self.width(), self.height()
+        pw, ph = self._scaled.width(), self._scaled.height()
+        x_off = (lw - pw) / 2
+        y_off = (lh - ph) / 2
+        x = event.position().x() - x_off
+        y = event.position().y() - y_off
+        if x < 0 or y < 0 or x >= pw or y >= ph:
+            self.coordsChanged.emit("")
+        else:
+            ow, oh = self._orig.width(), self._orig.height()
+            ox = int(x * ow / pw)
+            oy = int(y * oh / ph)
+            msg = f"x={ox}, y={oy}, esq={ox}, dir={ow-ox}, cima={oy}, baixo={oh-oy}"
+            self.coordsChanged.emit(msg)
+        super().mouseMoveEvent(event)
+
+# ==============
 # Editor PySide6 – com texto OTUI em tempo real
 # ==============
 class OTUIEditor(QMainWindow):
@@ -220,11 +270,10 @@ class OTUIEditor(QMainWindow):
 
         # Direita: preview
         right = QWidget(); rlay = QVBoxLayout(right)
-        self.preview_label = QLabel("Pré-visualização de imagem")
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumSize(350, 350)
-        self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview_label = ImagePreviewLabel()
+        self.preview_label.setText("Pré-visualização de imagem")
         rlay.addWidget(self.preview_label)
+        self.preview_label.coordsChanged.connect(self.status.showMessage)
         big_split.addWidget(right)
 
         container = QWidget(); lay = QVBoxLayout(container)
@@ -312,6 +361,7 @@ class OTUIEditor(QMainWindow):
         self.edit_tag.setText(item.text(0))
         self.edit_value.setText(item.text(1))
         self.update_preview_from_selection()
+        self.status.showMessage(f"Editando: {item.text(0)}", 3000)
 
     def apply_change(self):
         it = self.tree.currentItem()
@@ -352,28 +402,37 @@ class OTUIEditor(QMainWindow):
     def update_preview_from_selection(self):
         it = self.tree.currentItem()
         if not it:
-            self.preview_label.setText("Pré-visualização de imagem"); self.preview_label.setPixmap(QPixmap()); return
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("Pré-visualização de imagem")
+            self.status.clearMessage()
+            return
         tag = it.text(0).strip().lower()
         val = it.text(1).strip()
         # se for image-source ou parecer caminho de imagem
         if tag == "image-source" or "images" in val.lower() or any(val.lower().endswith(e) for e in IMG_EXTS):
             self._preview_image(val)
         else:
-            self.preview_label.setText("Pré-visualização de imagem"); self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("Pré-visualização de imagem")
+            self.status.clearMessage()
 
     def _preview_image(self, val: str):
         if not val:
-            self.preview_label.setText("Sem valor para imagem"); self.preview_label.setPixmap(QPixmap()); return
+            self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("Sem valor para imagem")
+            return
         v = val.strip().strip("'").strip('"')
         otui_dir = self.current_file.parent if self.current_file else Path.cwd()
         full = resolve_image(self.images_base, otui_dir, v)
         if full and full.exists():
             pix = QPixmap(str(full))
             if not pix.isNull():
-                self.preview_label.setPixmap(pix.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                self.preview_label.setText("")
+                self.preview_label.setPixmap(pix)
                 self.preview_label.setToolTip(str(full))
                 return
-        self.preview_label.setText("Imagem não encontrada"); self.preview_label.setPixmap(QPixmap())
+        self.preview_label.setPixmap(QPixmap())
+        self.preview_label.setText("Imagem não encontrada")
 
     # ---------- Undo/Redo ----------
     def undo(self):
